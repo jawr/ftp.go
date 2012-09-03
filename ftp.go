@@ -4,11 +4,13 @@
 package ftp
 
 import (
+  "os"
 	"fmt"
-	"os"
 	"net"
 	"strconv"
 	"strings"
+  "crypto/tls"
+  "bytes"
 )
 
 type FTP struct {
@@ -23,7 +25,7 @@ type FTP struct {
 	Debug   bool
 	stream  []byte
 	conn    net.Conn
-	Error   os.Error
+	Error   error
 }
 
 func (ftp *FTP) debugInfo(s string) {
@@ -47,32 +49,62 @@ func (ftp *FTP) Login(user, passwd string) {
 	ftp.passwd = passwd
 }
 
+func (ftp *FTP) Auth() {
+  ftp.Request("AUTH TLS")
+  conn := tls.Client(ftp.conn, &tls.Config{InsecureSkipVerify: true})
+  ftp.Error = conn.Handshake()
+  if ftp.Error != nil {
+    fmt.Printf("tls error: %s\n", ftp.Error)
+    os.Exit(1)
+  }
+  ftp.conn = conn
+}
+
 func (ftp *FTP) Response() (code int, message string) {
-	ret := make([]byte, 1024)
-	n, _ := ftp.conn.Read(ret)
-	msg := string(ret[:n])
-	code, _ = strconv.Atoi(msg[:3])
-	message = msg[4 : len(msg)-2]
+  message = ""
+  code = 0
+  var buffer bytes.Buffer
+  Again:
+  	ret := make([]byte, 1024)
+	  n, _ := ftp.conn.Read(ret)
+  	msg := string(ret[:n])
+    if len(msg) == 0 {
+      goto Again
+    }
+	  code, _ = strconv.Atoi(msg[:3])
+  	buffer.WriteString(msg[4 : len(msg)-2])
+    tmp := strings.Split(msg, "\n")
+    if tmp[len(tmp)-2][3] == 45 {
+      goto Again
+    }
+  if code == 0 {
+    buffer.WriteString("\n")
+    goto Again
+  }
+  message = buffer.String()
 	ftp.debugInfo("<*cmd*> " + ftp.cmd)
 	ftp.debugInfo(fmt.Sprintf("<*code*> %d", code))
 	ftp.debugInfo("<*message*> " + message)
 	return
 }
 
+func (ftp *FTP) RawRequest(cmd string) {
+  ftp.conn.Write([]byte(cmd + "\r\n"))
+  ftp.cmd = cmd
+}
+
 func (ftp *FTP) Request(cmd string) {
-	ftp.conn.Write([]byte(cmd + "\r\n"))
-	ftp.cmd = cmd
+  ftp.RawRequest(cmd)
 	ftp.Code, ftp.Message = ftp.Response()
-	if cmd == "PASV" {
+	if cmd == "PASV" || cmd == "CPSV" {
 		start, end := strings.Index(ftp.Message, "("), strings.Index(ftp.Message, ")")
-		s := strings.Split(ftp.Message[start:end], ",", -1)
+		s := strings.Split(ftp.Message[start:end], ",")
 		l1, _ := strconv.Atoi(s[len(s)-2])
 		l2, _ := strconv.Atoi(s[len(s)-1])
 		ftp.pasv = l1*256 + l2
 	}
 	if (cmd != "PASV") && (ftp.pasv > 0) {
 		ftp.Message = newRequest(ftp.host, ftp.pasv, ftp.stream)
-		ftp.debugInfo("<*response*> " + ftp.Message)
 		ftp.pasv = 0
 		ftp.stream = nil
 		ftp.Code, _ = ftp.Response()
@@ -81,6 +113,10 @@ func (ftp *FTP) Request(cmd string) {
 
 func (ftp *FTP) Pasv() {
 	ftp.Request("PASV")
+}
+
+func (ftp *FTP) Cpsv() {
+  ftp.Request("CPSV")
 }
 
 func (ftp *FTP) Pwd() {
@@ -104,6 +140,13 @@ func (ftp *FTP) Size(path string) (size int) {
 func (ftp *FTP) List() {
 	ftp.Pasv()
 	ftp.Request("LIST")
+}
+
+func (ftp *FTP) Statl(path string) {
+  var buffer bytes.Buffer
+  buffer.WriteString("STAT -l ")
+  buffer.WriteString(path)
+  ftp.Request(buffer.String())
 }
 
 func (ftp *FTP) Stor(file string, data []byte) {
